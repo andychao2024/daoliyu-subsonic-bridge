@@ -1,0 +1,26 @@
+[Unit]
+Description=道理鱼 Subsonic API Bridge
+Documentation=https://github.com/ccwu/daoliyu-subsonic-bridge
+After=network-online.target daoliyu.music.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/vol1/1000
+ExecStart=/usr/bin/python3 /vol1/1000/daoliyu_subsonic_bridge.py --host 0.0.0.0 --port 4040
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=daoliyu-subsonic
+
+# 安全加固 (可选)
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/vol1/1000 /vol1/@appshare/daoliyu.music/runtime/data
+
+[Install]
+WantedBy=multi-user.target
