@@ -15,8 +15,8 @@
 默认启用鉴权，自动同步道理鱼 users 表，用邮箱+密码登录
 """
 
-import os, sys, json, time, random, argparse, sqlite3, glob, crypt, hashlib, threading
-from urllib.parse import urlparse, parse_qs
+import os, sys, json, time, random, argparse, sqlite3, glob, crypt, hashlib, threading, re
+from urllib.parse import urlparse, parse_qs, quote
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 from xml.sax.saxutils import escape as xml_escape
@@ -30,13 +30,17 @@ ARTIST_CACHE = {}           # {artist_id: name}
 ALBUM_CACHE = {}            # {album_id: {title, year, cover_path}}
 TRACK_CACHE = []            # [{id, title, album_id, file_path, duration, track_number}]
 TRACK_ARTIST_MAP = {}       # {track_id: artist_id}  (sort_order=0 的主艺人)
+TRACK_ALL_MAP = {}          # {track_id: [artist_id, ...]}  所有艺人（含合作）
 ARTIST_ALBUMS = {}          # {artist_id: [album_id, ...]}  艺人→专辑列表
 ALBUM_ARTIST = {}           # {album_id: artist_id}  专辑→主艺人
+ALBUM_ARTISTS_ALL = {}      # {album_id: [artist_id, ...]}  专辑→所有艺人
 USER_CACHE = {}             # {email: {username, password_hash, role}}
 AUTH_ENABLED = True
 LAST_CACHE = 0
 DB = None
 DB_LOCK = threading.Lock()  # 多线程保护 SQLite
+MUSIC_DIR = ""  # 宿主机音乐目录，用于映射容器内 /music 路径
+DB_DIR = ""     # 宿主机上数据库所在目录，用于推算其他路径
 
 
 def find_db():
@@ -58,14 +62,42 @@ def find_db():
     return None
 
 
+def map_path(db_path):
+    """将数据库中的容器路径映射到宿主机路径"""
+    if not db_path:
+        return db_path
+    if MUSIC_DIR and db_path.startswith('/music/'):
+        return os.path.join(MUSIC_DIR, db_path[7:])
+    if db_path.startswith('/app/runtime/data/'):
+        return os.path.join(DB_DIR, db_path[18:])  # /app/runtime/data/ -> DB_DIR/
+    if db_path.startswith('system/'):
+        # system/covers/xxx -> runtime-prod/library/system/covers/xxx
+        library_dir = os.path.join(os.path.dirname(DB_DIR), 'library')
+        return os.path.join(library_dir, db_path)
+    return db_path
+
+
+def compact(obj):
+    """递归移除 dict 中值为 None 的键"""
+    if isinstance(obj, dict):
+        return {k: compact(v) for k, v in obj.items() if v is not None}
+    if isinstance(obj, list):
+        return [compact(v) for v in obj]
+    return obj
+
+
+
+
+
 def list_tables(cur):
     cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
     return [r[0] for r in cur.fetchall()]
 
 
 def init_db(path):
-    global DB
-    DB = sqlite3.connect(path, check_same_thread=False)
+    global DB, DB_DIR
+    DB_DIR = os.path.dirname(os.path.abspath(path))
+    DB = sqlite3.connect(path, check_same_thread=False, timeout=30)
     DB.row_factory = sqlite3.Row
     cur = DB.cursor()
     tables = list_tables(cur)
@@ -84,7 +116,7 @@ def init_db(path):
 def refresh_cache():
     """加载全部缓存 — 适配道理鱼真实 schema"""
     global LAST_CACHE, ARTIST_CACHE, ALBUM_CACHE, TRACK_CACHE
-    global TRACK_ARTIST_MAP, ARTIST_ALBUMS, ALBUM_ARTIST, USER_CACHE
+    global TRACK_ARTIST_MAP, TRACK_ALL_MAP, ARTIST_ALBUMS, ALBUM_ARTIST, ALBUM_ARTISTS_ALL, USER_CACHE
 
     now = time.time()
     if now - LAST_CACHE < 300 and ARTIST_CACHE:
@@ -124,13 +156,13 @@ def refresh_cache():
 
         # --- 歌曲 ---
         TRACK_CACHE.clear()
-        cur.execute(f'SELECT id, title, album_id, file_path, file_size, duration_seconds, track_number, bitrate, year, lyrics, lyrics_plain FROM "{trk_table}"')
+        cur.execute(f'SELECT id, title, album_id, file_path, file_size, duration_seconds, track_number, bitrate, year, lyrics, lyrics_plain, genres FROM "{trk_table}"')
         TRACK_CACHE.extend([dict(r) for r in cur.fetchall()])
         print(f"  歌曲: {len(TRACK_CACHE)}")
 
         # --- track_artists 全部映射 ---
         TRACK_ARTIST_MAP.clear()  # sort_order=0 主艺人
-        TRACK_ALL_MAP = {}        # {track_id: [artist_id, ...]} 所有艺人
+        TRACK_ALL_MAP.clear()     # {track_id: [artist_id, ...]} 所有艺人
         if ta_table:
             cur.execute(f'SELECT track_id, artist_id, sort_order FROM "{ta_table}" ORDER BY sort_order')
             for r in cur.fetchall():
@@ -154,6 +186,15 @@ def refresh_cache():
             for art_id in TRACK_ALL_MAP.get(tid, []):
                 if aid:
                     ARTIST_ALBUMS.setdefault(art_id, set()).add(aid)
+
+        # 专辑→所有艺人 (用于合作专辑)
+        ALBUM_ARTISTS_ALL.clear()
+        for t in TRACK_CACHE:
+            tid = t['id']
+            aid = t['album_id']
+            if aid:
+                for art_id in TRACK_ALL_MAP.get(tid, []):
+                    ALBUM_ARTISTS_ALL.setdefault(aid, set()).add(art_id)
 
         for aid in ARTIST_CACHE:
             if aid not in ARTIST_ALBUMS:
@@ -186,9 +227,61 @@ class SubsonicHandler(BaseHTTPRequestHandler):
         """处理 CORS 预检请求"""
         self.send_response(200)
         self.send_header('Access-Control-Allow-Origin', '*')
-        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+        self.send_header('Access-Control-Allow-Methods', 'GET, POST, HEAD, OPTIONS')
         self.send_header('Access-Control-Allow-Headers', '*')
         self.send_header('Access-Control-Max-Age', '86400')
+        self.end_headers()
+
+    def do_HEAD(self):
+        """处理 HEAD 请求 (Music Assistant 用于获取文件大小)"""
+        parsed = urlparse(self.path)
+        path = parsed.path
+        qs = parse_qs(parsed.query)
+
+        # 鉴权
+        if AUTH_ENABLED:
+            user = qs.get('u', [''])[0]
+            pwd = qs.get('p', [''])[0]
+            token = qs.get('t', [''])[0]
+            salt = qs.get('s', [''])[0]
+            if not self.authenticate(user, pwd, token, salt):
+                self.send_response(401)
+                self.end_headers()
+                return
+
+        if '/rest/stream' in path:
+            track_id = qs.get('id', [''])[0]
+            fp = None
+            for t in TRACK_CACHE:
+                if t['id'] == track_id:
+                    fp = t.get('file_path', '')
+                    break
+            if fp:
+                fp = map_path(fp)
+            if fp and os.path.exists(fp):
+                file_size = os.path.getsize(fp)
+                ext = os.path.splitext(fp)[1].lower()
+                mimes = {'.flac': 'audio/flac', '.mp3': 'audio/mpeg', '.m4a': 'audio/mp4',
+                         '.ogg': 'audio/ogg', '.wav': 'audio/wav', '.aac': 'audio/aac',
+                         '.opus': 'audio/opus', '.wma': 'audio/x-ms-wma'}
+                mime = mimes.get(ext, 'audio/mpeg')
+                self.send_response(200)
+                self.send_header('Content-Type', mime)
+                self.send_header('Content-Length', str(file_size))
+                self.send_header('Accept-Ranges', 'bytes')
+                self.end_headers()
+                return
+            self.send_response(404)
+            self.end_headers()
+            return
+
+        if '/rest/getCoverArt' in path:
+            self.send_response(200)
+            self.send_header('Content-Type', 'image/jpeg')
+            self.end_headers()
+            return
+
+        self.send_response(200)
         self.end_headers()
 
     def _to_xml(self, data, root_tag=''):
@@ -244,6 +337,16 @@ class SubsonicHandler(BaseHTTPRequestHandler):
         xml += self._to_xml(sr, 'subsonic-response')
         return xml.encode('utf-8')
 
+    def do_POST(self):
+        """处理 POST 请求 — MA 使用 formPost 扩展后所有请求走 POST"""
+        ctype = self.headers.get('Content-Type', '')
+        body_len = int(self.headers.get('Content-Length', 0))
+        body = self.rfile.read(body_len).decode('utf-8') if body_len else ''
+        # 将 POST form 参数拼接到 URL query string，复用 do_GET 逻辑
+        sep = '&' if '?' in self.path else '?'
+        self.path = f'{self.path}{sep}{body}'
+        self.do_GET()
+
     def do_GET(self):
         parsed = urlparse(self.path)
         path = parsed.path
@@ -252,6 +355,7 @@ class SubsonicHandler(BaseHTTPRequestHandler):
         # 鉴权跳过路径（ping、getSalt 不需要认证）
         no_auth_paths = ['/rest/ping', '/rest/ping.view', '/rest/getSalt', '/rest/getSalt.view']
 
+        fmt = qs.get('f', ['json'])[0]
         if AUTH_ENABLED and not any(p in path for p in no_auth_paths):
             user = qs.get('u', [''])[0]
             pwd  = qs.get('p', [''])[0]
@@ -266,7 +370,7 @@ class SubsonicHandler(BaseHTTPRequestHandler):
                     body = self._xml_response(resp)
                     ct = 'text/xml; charset=utf-8'
                 else:
-                    body = json.dumps({"subsonic-response": resp}, ensure_ascii=False, default=str).encode('utf-8')
+                    body = json.dumps({"subsonic-response": compact(resp)}, ensure_ascii=False, default=str).encode('utf-8')
                     ct = 'application/json; charset=utf-8'
                 self.send_response(401)
                 self.send_header('Content-Type', ct)
@@ -275,75 +379,46 @@ class SubsonicHandler(BaseHTTPRequestHandler):
                 self.wfile.write(body)
                 return
 
-        # 流媒体单独处理
-        if '/rest/stream' in path:
+        # 流媒体 & 下载 & 封面 — 二进制响应，不经过 JSON 序列化
+        if '/rest/stream' in path or '/rest/download' in path:
             self.serve_stream(qs)
             return
 
-        # 封面代理
         if '/rest/getCoverArt' in path:
             self.serve_cover(qs)
             return
 
-        fmt = qs.get('f', ['json'])[0]
-        resp = {"status": "ok", "version": "1.16.0",
-                "xmlns": "http://subsonic.org/restapi",
-                "type": "funkwhale", "funkwhaleVersion": "1"}
+        resp = {"status": "ok", "version": "1.16.1",
+                "xmlns": "http://subsonic.org/restapi"}
 
         try:
             refresh_cache()
-            if '/rest/getArtists' in path:
-                self.handle_get_artists(resp, 'artists')
-            elif '/rest/getIndexes' in path:
-                self.handle_get_artists(resp, 'indexes')
-            elif '/rest/getArtist' in path:
-                self.handle_get_artist(resp, qs)
-            elif '/rest/getSong' in path:
-                self.handle_get_song(resp, qs)
-            elif '/rest/scrobble' in path:
-                self.handle_scrobble(resp, qs)
-            elif '/rest/getAlbumList2' in path:
-                self.handle_get_album_list(resp, qs)
-            elif '/rest/getMusicDirectory' in path:
-                self.handle_get_music_directory(resp, qs)
-            elif '/rest/getAlbum' in path:
-                self.handle_get_album(resp, qs)
-            elif '/rest/search3' in path:
-                self.handle_search(resp, qs)
-            elif '/rest/search2' in path:
-                self.handle_search2(resp, qs)
-            elif '/rest/getRandomSongs' in path:
-                self.handle_random_songs(resp, qs)
-            elif '/rest/getSongsByGenre' in path:
-                self.handle_songs_by_genre(resp, qs)
-            elif '/rest/getPlaylists' in path:
-                self.handle_get_playlists(resp, qs)
-            elif '/rest/getPlaylist' in path:
-                self.handle_get_playlist(resp, qs)
-            elif '/rest/getMusicFolders' in path:
-                self.handle_get_music_folders(resp, qs)
-            elif '/rest/getUser' in path:
-                self.handle_get_user(resp, qs)
-            elif '/rest/getGenres' in path:
-                self.handle_get_genres(resp, qs)
-            elif '/rest/getLyricsBySongId' in path:
-                self.handle_get_lyrics_by_song_id(resp, qs)
-            elif '/rest/getLyrics' in path:
-                self.handle_get_lyrics(resp, qs)
-            elif '/rest/getStarred' in path or '/rest/getStarred2' in path:
-                self.handle_get_starred(resp, qs)
-            elif '/rest/star' in path and 'starred' not in path:
-                self.handle_star(resp, qs)
-            elif '/rest/unstar' in path:
-                self.handle_unstar(resp, qs)
-            elif '/rest/getSalt' in path or '/rest/getSalt.view' in path:
-                self.handle_get_salt(resp, qs)
-            elif '/rest/getScanStatus' in path:
-                self.handle_get_scan_status(resp)
-            elif '/rest/ping' in path or '/rest/ping.view' in path:
+
+            # 从 URL 提取方法名: /rest/rest/getAlbum.view → getAlbum
+            method = path.rstrip('/').split('/')[-1].replace('.view', '')
+
+            if method == 'ping' or method == 'getPing':
                 pass
             else:
-                resp['error'] = {'code': 0, 'message': f'Not implemented: {path}'}
+                # CamelCase → snake_case: getAlbum → get_album → handle_get_album
+                snake = re.sub(r'(?<!^)(?=[A-Z])', '_', method).lower()
+                handler_name = f'handle_{snake}'
+                # 命名偏差补偿
+                _OVERRIDE = {
+                    'handle_get_album_list2': 'handle_get_album_list',
+                    'handle_album_list2': 'handle_get_album_list',
+                    'handle_search3': 'handle_search',
+                    'handle_get_random_songs': 'handle_random_songs',
+                    'handle_get_songs_by_genre': 'handle_songs_by_genre',
+                    'handle_get_starred2': 'handle_get_starred',
+                    'handle_get_similar_songs2': 'handle_get_similar_songs',
+                }
+                handler_name = _OVERRIDE.get(handler_name, handler_name)
+                handler = getattr(self, handler_name, None)
+                if handler:
+                    handler(resp, qs)
+                else:
+                    resp['error'] = {'code': 0, 'message': f'Not implemented: {method}'}
         except Exception as e:
             resp['status'] = 'failed'
             resp['error'] = {'code': 1, 'message': str(e)}
@@ -352,7 +427,7 @@ class SubsonicHandler(BaseHTTPRequestHandler):
             body = self._xml_response(resp)
             ct = 'text/xml; charset=utf-8'
         else:
-            body = json.dumps({"subsonic-response": resp}, ensure_ascii=False, default=str).encode('utf-8')
+            body = json.dumps({"subsonic-response": compact(resp)}, ensure_ascii=False, default=str).encode('utf-8')
             ct = 'application/json; charset=utf-8'
 
         self.send_response(200)
@@ -407,6 +482,29 @@ class SubsonicHandler(BaseHTTPRequestHandler):
         salt = hashlib.md5(str(time.time() + random.random()).encode()).hexdigest()[:16]
         resp['salt'] = salt
 
+    @staticmethod
+    def _parse_lrc(lrc_text):
+        """解析 LRC 格式为 structuredLyrics lines"""
+        if not lrc_text:
+            return []
+        lines = []
+        for line in lrc_text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            m = re.match(r'\[(\d+):(\d+)(?:[\.:](\d+))?\](.*)', line)
+            if m:
+                mins = int(m.group(1))
+                secs = int(m.group(2))
+                frac = int(m.group(3)) if m.group(3) else 0
+                if frac > 999:
+                    frac = int(round(frac / 10)) if frac >= 1000 else frac
+                start_ms = mins * 60000 + secs * 1000 + frac
+                text = m.group(4).strip()
+                if text:
+                    lines.append({"start": start_ms, "value": text})
+        return lines
+
     def handle_get_lyrics_by_song_id(self, resp, qs):
         """按歌曲 ID 获取歌词 — SPlayer/OpenSubsonic 格式"""
         tid = qs.get('id', [''])[0]
@@ -416,9 +514,18 @@ class SubsonicHandler(BaseHTTPRequestHandler):
                 plain = t.get('lyrics_plain', '') or ''
                 text = lrc if lrc else plain
                 art_id = TRACK_ARTIST_MAP.get(tid, '')
+                structured = []
+                if lrc:
+                    parsed = self._parse_lrc(lrc)
+                    if parsed:
+                        structured = [{"displayArtist": self._artist_name(art_id),
+                                       "displayTitle": t.get('title', ''),
+                                       "lang": "chi",
+                                       "synced": True,
+                                       "line": parsed}]
                 resp['lyricsList'] = {
                     "lyrics": [{"content": text, "artist": self._artist_name(art_id), "title": t.get('title', '')}],
-                    "structuredLyrics": [],
+                    "structuredLyrics": structured,
                 }
                 return
 
@@ -496,12 +603,7 @@ class SubsonicHandler(BaseHTTPRequestHandler):
             for aid in fav_albums:
                 al = ALBUM_CACHE.get(aid)
                 if al:
-                    art_id = ALBUM_ARTIST.get(aid, '')
-                    starred['album'].append({
-                        'id': aid, 'name': al['title'],
-                        'artist': self._artist_name(art_id),
-                        'year': al['year'],
-                    })
+                    starred['album'].append(self._build_album_dict(aid, al))
 
             for aid in fav_artists:
                 name = ARTIST_CACHE.get(aid)
@@ -549,22 +651,31 @@ class SubsonicHandler(BaseHTTPRequestHandler):
             DB.commit()
 
     def handle_get_playlists(self, resp, qs):
-        """返回歌单列表 (含歌曲)"""
         playlists = []
         with DB_LOCK:
             cur = DB.cursor()
             cur.execute("SELECT id, name, description, cover_art_path FROM playlists")
             for r in cur.fetchall():
-                pl = {'id': r[0], 'name': r[1], 'comment': r[2] or '',
-                      'coverArt': r[0], 'entry': []}
-                cur.execute("SELECT track_id FROM playlist_tracks WHERE playlist_id=? ORDER BY track_order", (r[0],))
+                pl_id = r[0]
+                entry = []
+                dur = 0
+                cur.execute("SELECT track_id FROM playlist_tracks WHERE playlist_id=? ORDER BY track_order", (pl_id,))
                 for tr in cur.fetchall():
-                    tid = tr[0]
                     for t in TRACK_CACHE:
-                        if t['id'] == tid:
-                            pl['entry'].append(self._build_song(t))
+                        if t['id'] == tr[0]:
+                            s = self._build_song(t)
+                            entry.append(s)
+                            dur += s.get('duration', 0)
                             break
-                playlists.append(pl)
+                playlists.append({
+                    'id': pl_id, 'name': r[1] or '',
+                    'comment': r[2] or '', 'coverArt': pl_id,
+                    'owner': '', 'public': True,
+                    'songCount': len(entry), 'duration': dur,
+                    'created': '2020-01-01T00:00:00.000Z',
+                    'changed': '2020-01-01T00:00:00.000Z',
+                    'entry': entry,
+                })
         resp['playlists'] = {'playlist': playlists}
 
     def handle_get_playlist(self, resp, qs):
@@ -584,14 +695,21 @@ class SubsonicHandler(BaseHTTPRequestHandler):
                         if t['id'] == tid:
                             entry.append(self._build_song(t))
                             break
+                dur = sum(s.get('duration', 0) for s in entry)
                 resp['playlist'] = {
                     'id': pl_id, 'name': pl_name, 'comment': pl_desc,
-                    'coverArt': pl_id, 'entry': entry,
+                    'coverArt': pl_id, 'owner': '', 'public': True,
+                    'songCount': len(entry), 'duration': dur,
+                    'created': '2020-01-01T00:00:00.000Z',
+                    'changed': '2020-01-01T00:00:00.000Z',
+                    'entry': entry,
                 }
                 return
-        resp['playlist'] = {'id': pl_id, 'name': '', 'entry': []}
+        resp['playlist'] = {'id': pl_id, 'name': '', 'entry': [],
+            'owner': '', 'public': True, 'songCount': 0, 'duration': 0,
+            'created': '2020-01-01T00:00:00.000Z', 'changed': '2020-01-01T00:00:00.000Z'}
 
-    def handle_get_scan_status(self, resp):
+    def handle_get_scan_status(self, resp, qs=None):
         """返回扫描状态和数据库统计"""
         album_count = len(ALBUM_CACHE)
         artist_count = len(ARTIST_CACHE)
@@ -611,6 +729,19 @@ class SubsonicHandler(BaseHTTPRequestHandler):
             'folderCount': len(folders),
         }
 
+    def handle_get_license(self, resp, qs):
+        resp['license'] = {
+            'valid': True,
+            'email': 'daoliyu@local',
+            'licenseExpires': '2099-12-31T23:59:59'
+        }
+
+    def handle_get_open_subsonic_extensions(self, resp, qs):
+        resp['openSubsonicExtensions'] = [
+            {'name': 'formPost', 'versions': [1]},
+            {'name': 'songLyrics', 'versions': [1]},
+        ]
+
     def handle_get_music_folders(self, resp, qs):
         """返回音乐文件夹 (统计用)"""
         resp['musicFolders'] = {'musicFolder': [
@@ -629,19 +760,31 @@ class SubsonicHandler(BaseHTTPRequestHandler):
         }
 
     def handle_get_genres(self, resp, qs):
-        """返回流派列表 (从 tracks 提取 genres 字段)"""
-        genres = set()
+        """返回流派列表（从 tracks 提取 genres JSON 数组）"""
+        genre_data = {}  # {genre_name: {songs: set, albums: set}}
         for t in TRACK_CACHE:
-            g = (t.get('genres', '') or '')
-            if g:
-                for genre in g.split(','):
-                    genre = genre.strip()
-                    if genre:
-                        genres.add(genre)
-        items = [{'value': g, 'songCount': 0, 'albumCount': 0} for g in sorted(genres)[:100]]
+            raw = t.get('genres', '') or ''
+            if not raw:
+                continue
+            try:
+                glist = json.loads(raw)
+            except:
+                glist = [g.strip() for g in raw.split(',') if g.strip()]
+            for g in glist:
+                if g not in genre_data:
+                    genre_data[g] = {'songs': set(), 'albums': set()}
+                genre_data[g]['songs'].add(t['id'])
+                genre_data[g]['albums'].add(t.get('album_id', ''))
+        items = [{'value': g, 'songCount': len(v['songs']), 'albumCount': len(v['albums'])}
+                 for g, v in sorted(genre_data.items())[:100]]
         resp['genres'] = {'genre': items}
 
     def _artist_name(self, artist_id):
+        if isinstance(artist_id, str) and artist_id not in ARTIST_CACHE:
+            try:
+                artist_id = int(artist_id)
+            except (ValueError, TypeError):
+                pass
         return ARTIST_CACHE.get(artist_id, '')
 
     def _build_song(self, t):
@@ -672,23 +815,56 @@ class SubsonicHandler(BaseHTTPRequestHandler):
             "albumId": aid if aid else '',
             "artistId": art_id if art_id else '',
             "type": "music",
-            "coverArt": "al-" + aid if aid else '',
+            "coverArt": aid if aid else '',
             "bitRate": int(t.get('bitrate') or 0),
             "size": int(t.get('file_size') or 0),
         }
+        all_artists = TRACK_ALL_MAP.get(t['id'], [])
+        if len(all_artists) > 1:
+            s["artists"] = [
+                {"id": a_id, "name": self._artist_name(a_id)}
+                for a_id in all_artists
+            ]
+            s["displayArtist"] = " / ".join(
+                self._artist_name(a_id) for a_id in all_artists
+            )
         if t.get('year'):
             s["year"] = t['year']
         return s
 
-    def handle_get_artists(self, resp, tag='artists'):
-        """getArtists → <artists>, getIndexes → <indexes>"""
+    def _build_album_dict(self, alb_id, al, primary_artist_id=None):
+        """构建专辑响应 dict，包含所有合作艺人列表"""
+        song_cnt = sum(1 for t in TRACK_CACHE if t['album_id'] == alb_id)
+        duration = sum(int(t.get('duration_seconds', 0) or 0) for t in TRACK_CACHE if t['album_id'] == alb_id)
+        album_year = int(al.get('year', 0)) if al.get('year') else None
+        pid = primary_artist_id or ALBUM_ARTIST.get(alb_id, '')
+        album = {
+            "id": alb_id,
+            "name": al.get('title', ''),
+            "artist": self._artist_name(pid),
+            "year": album_year,
+            "artistId": pid if pid else '',
+            "coverArt": alb_id,
+            "songCount": song_cnt,
+            "duration": duration,
+            "created": "2020-01-01T00:00:00.000Z",
+        }
+        all_aids = ALBUM_ARTISTS_ALL.get(alb_id)
+        if all_aids and len(all_aids) > 1:
+            album["artists"] = [
+                {"id": a_id, "name": self._artist_name(a_id)}
+                for a_id in sorted(all_aids)
+            ]
+        return album
+
+    def handle_get_artists(self, resp, qs):
+        tag = 'indexes' if '/getIndexes' in self.path else 'artists'
         items = []
         for aid, name in ARTIST_CACHE.items():
             cnt = len(ARTIST_ALBUMS.get(aid, set()))
             items.append({"id": aid, "name": name, "albumCount": cnt, "coverArt": "ar-" + aid})
         items.sort(key=lambda x: x['name'].lower())
 
-        # A-Z 索引
         idx = {}
         for item in items:
             k = item['name'][0].upper() if item['name'] else '#'
@@ -697,8 +873,13 @@ class SubsonicHandler(BaseHTTPRequestHandler):
             idx.setdefault(k, []).append(item)
 
         resp[tag] = {
+            "ignoredArticles": "The El La Los Las Le Les",
+            "ignored_articles": "The El La Los Las Le Les",
             "index": [{"name": k, "artist": v} for k, v in sorted(idx.items())]
         }
+
+    def handle_get_indexes(self, resp, qs):
+        self.handle_get_artists(resp, qs)
 
     def handle_scrobble(self, resp, qs):
         """记录播放 (不实际操作数据库，只返回空成功响应)"""
@@ -715,9 +896,31 @@ class SubsonicHandler(BaseHTTPRequestHandler):
     def handle_get_music_directory(self, resp, qs):
         """文件结构浏览：artist id → 专辑列表, album id → 歌曲列表"""
         dir_id = qs.get('id', [''])[0]
+
+        # URL 参数是字符串，缓存 key 是 int，需要转换
+        try:
+            dir_int = int(dir_id)
+        except (ValueError, TypeError):
+            dir_int = None
+
         children = []
-        if dir_id.startswith('art_'):
-            # artist → 专辑
+
+        # 优先检测是否是艺人 ID（getArtists/getIndexes 返回的原始 ID）
+        if dir_int is not None and dir_int in ARTIST_CACHE:
+            for alb_id in sorted(ARTIST_ALBUMS.get(dir_int, set())):
+                al = ALBUM_CACHE.get(alb_id, {})
+                if al:
+                    song_cnt = sum(1 for t in TRACK_CACHE if t['album_id'] == alb_id)
+                    children.append({
+                        "id": alb_id, "title": al.get('title', ''),
+                        "parent": dir_id, "isDir": True,
+                        "artist": self._artist_name(dir_int),
+                        "artistId": str(dir_int),
+                        "year": al.get('year', ''),
+                        "coverArt": alb_id,
+                    })
+        elif dir_id.startswith('art_'):
+            # 数据库 ID 已含 art_ 前缀，直接使用全量 ID 查找
             for alb_id in sorted(ARTIST_ALBUMS.get(dir_id, set())):
                 al = ALBUM_CACHE.get(alb_id, {})
                 if al:
@@ -731,23 +934,13 @@ class SubsonicHandler(BaseHTTPRequestHandler):
                         "coverArt": alb_id,
                     })
         else:
-            # album → 歌曲
-            al = ALBUM_CACHE.get(dir_id, {})
+            # album → 歌曲：复用 _build_song 确保所有必需字段
             for t in TRACK_CACHE:
                 if t['album_id'] == dir_id:
-                    t_art_id = TRACK_ARTIST_MAP.get(t['id'], '')
-                    children.append({
-                        "id": t['id'], "title": t.get('title', ''),
-                        "parent": dir_id, "isDir": False,
-                        "album": al.get('title', ''),
-                        "artist": self._artist_name(t_art_id),
-                        "albumId": dir_id,
-                        "artistId": t_art_id if t_art_id else '',
-                        "duration": int(t.get('duration_seconds', 0) or 0),
-                        "track": t.get('track_number', 0) or 0,
-                        "year": t.get('year', 0) or 0,
-                        "coverArt": dir_id,
-                    })
+                    s = self._build_song(t)
+                    s['parent'] = dir_id
+                    s['coverArt'] = dir_id
+                    children.append(s)
         resp['directory'] = {"id": dir_id, "child": children}
 
     def handle_get_artist(self, resp, qs):
@@ -757,25 +950,59 @@ class SubsonicHandler(BaseHTTPRequestHandler):
         for alb_id in sorted(ARTIST_ALBUMS.get(aid, set())):
             al = ALBUM_CACHE.get(alb_id, {})
             if al:
-                song_cnt = sum(1 for t in TRACK_CACHE if t['album_id'] == alb_id)
-                duration = sum(int(t.get('duration_seconds', 0) or 0) for t in TRACK_CACHE if t['album_id'] == alb_id)
-                albums.append({
-                    "id": alb_id,
-                    "name": al.get('title', ''),
-                    "artist": name,
-                    "year": al.get('year', 0) or 0,
-                    "artistId": aid,
-                    "coverArt": "al-" + alb_id,
-                    "songCount": song_cnt,
-                    "duration": duration,
-                })
+                albums.append(self._build_album_dict(alb_id, al, primary_artist_id=aid))
         resp['artist'] = {
             "id": aid,
             "name": name,
             "albumCount": len(albums),
             "album": albums,
             "coverArt": "ar-" + aid,
+            "artistImageUrl": "",
         }
+
+    def handle_get_artist_info2(self, resp, qs):
+        aid = qs.get('id', [''])[0]
+        bio = ''
+        cover_url = ''
+        try:
+            with DB_LOCK:
+                cur = DB.cursor()
+                cur.execute("SELECT bio, cover_art_path FROM artists WHERE id=?", (aid,))
+                row = cur.fetchone()
+            if row:
+                bio = row[0] or ''
+                if row[1]:
+                    cover_url = '/api/cover?path=' + quote(row[1])
+        except:
+            pass
+        resp['artistInfo2'] = {
+            "biography": bio,
+            "musicBrainzId": "",
+            "lastFmUrl": "",
+            "smallImageUrl": cover_url,
+            "mediumImageUrl": cover_url,
+            "largeImageUrl": cover_url,
+            "similarArtist": [],
+        }
+
+    def handle_get_album_info2(self, resp, qs):
+        resp['albumInfo'] = resp['albumInfo2'] = {
+            "notes": "", "musicBrainzId": "",
+            "smallImageUrl": "", "mediumImageUrl": "", "largeImageUrl": "",
+            "lastFmUrl": "",
+        }
+
+    def handle_get_newest_podcasts(self, resp, qs):
+        resp['newestPodcasts'] = {"episode": []}
+
+    def handle_get_podcasts(self, resp, qs):
+        resp['podcasts'] = {"channel": []}
+
+    def handle_get_top_songs(self, resp, qs):
+        resp['topSongs'] = {"song": []}
+
+    def handle_get_similar_songs(self, resp, qs):
+        resp['similarSongs'] = {"song": []}
 
     def handle_get_album_list(self, resp, qs):
         size = int(qs.get('size', ['50'])[0])
@@ -797,38 +1024,18 @@ class SubsonicHandler(BaseHTTPRequestHandler):
                 for aid in fav_ids:
                     al = ALBUM_CACHE.get(aid)
                     if al:
-                        art_id = ALBUM_ARTIST.get(aid, '')
-                        song_cnt = sum(1 for t in TRACK_CACHE if t['album_id'] == aid)
-                        duration = sum(int(t.get('duration_seconds',0) or 0) for t in TRACK_CACHE if t['album_id']==aid)
-                        items.append({
-                            "id": aid, "name": al['title'],
-                            "artist": self._artist_name(art_id),
-                            "year": al.get('year', 0) or 0,
-                            "artistId": art_id if art_id else '',
-                            "coverArt": "al-" + aid,
-                            "songCount": song_cnt,
-                            "duration": duration,
-                            "playCount": 1,
-                        })
+                        item = self._build_album_dict(aid, al)
+                        item["playCount"] = 1
+                        item["coverArt"] = "al-" + aid
+                        items.append(item)
             resp['albumList2'] = {"album": items[offset:offset+size]}
             return
 
         # 全量专辑列表
         for alb_id, al in ALBUM_CACHE.items():
-            art_id = ALBUM_ARTIST.get(alb_id, '')
-            song_cnt = sum(1 for t in TRACK_CACHE if t['album_id'] == alb_id)
-            duration = sum(int(t.get('duration_seconds',0) or 0) for t in TRACK_CACHE if t['album_id']==alb_id)
-            items.append({
-                "id": alb_id,
-                "name": al['title'],
-                "artist": self._artist_name(art_id),
-                "year": al.get('year', 0) or 0,
-                "artistId": art_id if art_id else '',
-                "coverArt": "al-" + alb_id,
-                "songCount": song_cnt,
-                "duration": duration,
-                "playCount": 1,
-            })
+            item = self._build_album_dict(alb_id, al)
+            item["playCount"] = 1
+            items.append(item)
 
         if atype in ('newest', 'byYear', 'recent', 'byGenre'):
             items.sort(key=lambda a: int(a.get('year', 0) or 0), reverse=True)
@@ -853,30 +1060,47 @@ class SubsonicHandler(BaseHTTPRequestHandler):
                 songs.append(self._build_song(t))
 
         songs.sort(key=lambda s: s['track'])
-        art_id = ALBUM_ARTIST.get(alb_id, '')
-        aname = self._artist_name(art_id)
-        resp['album'] = {
-            "id": alb_id,
-            "name": al.get('title', ''),
-            "artist": aname,
-            "song": songs,
-            "coverArt": alb_id,
-        }
+        resp['album'] = self._build_album_dict(alb_id, al)
+        resp['album']["song"] = songs
 
     def handle_search(self, resp, qs):
+        """search3 — 返回歌曲、艺人、专辑（空查询返回全部）"""
         raw = (qs.get('query', [''])[0] or '')
-        query = raw.strip('" ').lower()  # 去掉外层双引号和空格
+        query = raw.strip('" ').lower()
         song_count = int(qs.get('songCount', ['50'])[0])
+        artist_count = int(qs.get('artistCount', ['20'])[0])
+        album_count = int(qs.get('albumCount', ['20'])[0])
         song_offset = int(qs.get('songOffset', ['0'])[0])
+        artist_offset = int(qs.get('artistOffset', ['0'])[0])
+        album_offset = int(qs.get('albumOffset', ['0'])[0])
 
-        # 空 query 或 "" → 返回全部歌曲
-        songs = []
+        artists, albums, songs = [], [], []
+
+        for aid, name in ARTIST_CACHE.items():
+            if not query or query in name.lower():
+                artists.append({
+                    "id": aid, "name": name,
+                    "albumCount": len(ARTIST_ALBUMS.get(aid, set())),
+                })
+
+        for alb_id, al in ALBUM_CACHE.items():
+            title = (al.get('title', '') or '').lower()
+            if not query or query in title:
+                albums.append(self._build_album_dict(alb_id, al))
+
         for t in TRACK_CACHE:
             title = (t.get('title', '') or '').lower()
             if not query or query in title:
                 songs.append(self._build_song(t))
 
-        resp['searchResult3'] = {"song": songs[song_offset:song_offset+song_count]}
+        result = {}
+        if artists:
+            result["artist"] = artists[artist_offset:artist_offset+artist_count]
+        if albums:
+            result["album"] = albums[album_offset:album_offset+album_count]
+        if songs:
+            result["song"] = songs[song_offset:song_offset+song_count]
+        resp['searchResult3'] = result
 
     def handle_search2(self, resp, qs):
         """search2 — 返回艺人、专辑、歌曲（空查询返回全部）"""
@@ -911,11 +1135,24 @@ class SubsonicHandler(BaseHTTPRequestHandler):
         }
 
     def handle_songs_by_genre(self, resp, qs):
-        """按流派获取歌曲（无 genre 参数时返回全部歌曲）"""
+        """按流派获取歌曲"""
+        genre = qs.get('genre', [''])[0]
         size = int(qs.get('count', ['50'])[0])
         offset = int(qs.get('offset', ['0'])[0])
-        songs = [self._build_song(t) for t in TRACK_CACHE]
-        resp['songsByGenre'] = {"song": songs[offset:offset+size]}
+        if genre:
+            matched = []
+            for t in TRACK_CACHE:
+                raw = t.get('genres', '') or ''
+                try:
+                    glist = json.loads(raw)
+                except:
+                    glist = [g.strip() for g in raw.split(',') if g.strip()]
+                if genre in glist:
+                    matched.append(t)
+        else:
+            matched = list(TRACK_CACHE)
+        songs = [self._build_song(t) for t in matched[offset:offset+size]]
+        resp['songsByGenre'] = {"song": songs}
 
     def handle_random_songs(self, resp, qs):
         size = int(qs.get('size', ['10'])[0])
@@ -931,30 +1168,42 @@ class SubsonicHandler(BaseHTTPRequestHandler):
     def serve_stream(self, qs):
         track_id = qs.get('id', [''])[0]
 
-        # 从缓存找路径
         fp = None
         for t in TRACK_CACHE:
             if t['id'] == track_id:
                 fp = t.get('file_path', '')
                 break
 
-        if fp and os.path.exists(fp):
-            self._send_file(fp)
-            return
+        if fp:
+            host_fp = map_path(fp)
+            if os.path.exists(host_fp):
+                self._send_file(host_fp)
+                return
 
-        # fallback: 路径可能不在缓存，直接查库
         try:
             with DB_LOCK:
                 cur = DB.cursor()
                 cur.execute("SELECT file_path FROM tracks WHERE id=?", (track_id,))
                 row = cur.fetchone()
-            if row and row[0] and os.path.exists(row[0]):
-                self._send_file(row[0])
-                return
+            if row and row[0]:
+                host_fp = map_path(row[0])
+                if os.path.exists(host_fp):
+                    self._send_file(host_fp)
+                    return
         except:
             pass
 
         self.send_error(404, "File not found")
+
+    PLACEHOLDER_PNG = b'\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x02\x00\x00\x00\x90wS\xde\x00\x00\x00\x0cIDATx\x9cc\xf8\x0f\x00\x00\x01\x01\x00\x05\x18\xd8N\x00\x00\x00\x00IEND\xaeB`\x82'
+
+    def _placeholder_image(self):
+        self.send_response(200)
+        self.send_header('Content-Type', 'image/png')
+        self.send_header('Content-Length', str(len(self.PLACEHOLDER_PNG)))
+        self.send_header('Cache-Control', 'public, max-age=86400')
+        self.end_headers()
+        self.wfile.write(self.PLACEHOLDER_PNG)
 
     def serve_cover(self, qs):
         """代理封面图片 — 支持 al-xxx / ar-xxx / pl-xxx 前缀"""
@@ -965,16 +1214,27 @@ class SubsonicHandler(BaseHTTPRequestHandler):
         if cov_id.startswith('al-'):
             real_id = cov_id[3:]
         elif cov_id.startswith('ar-'):
-            # 艺人封面 → 取第一个专辑的封面
+            # 艺人封面 → 查 artists 表 cover_art_path
             aid = cov_id[3:]
+            try:
+                with DB_LOCK:
+                    cur = DB.cursor()
+                    cur.execute("SELECT cover_art_path FROM artists WHERE id=?", (aid,))
+                    row = cur.fetchone()
+                if row and row[0] and os.path.exists(map_path(row[0])):
+                    self._send_file(map_path(row[0]), is_image=True)
+                    return
+            except:
+                pass
+            # fallback: 取第一个专辑的封面
             alb_ids = ARTIST_ALBUMS.get(aid, set())
             for alb_id in alb_ids:
                 al = ALBUM_CACHE.get(alb_id, {})
                 cp = al.get('cover_path', '')
-                if cp and os.path.exists(cp):
-                    self._send_file(cp, is_image=True)
+                if cp and os.path.exists(map_path(cp)):
+                    self._send_file(map_path(cp), is_image=True)
                     return
-            self.send_error(404, "No cover for artist")
+            self._placeholder_image()
             return
         elif cov_id.startswith('pl-'):
             # 歌单封面
@@ -983,10 +1243,10 @@ class SubsonicHandler(BaseHTTPRequestHandler):
                 cur = DB.cursor()
                 cur.execute("SELECT cover_art_path FROM playlists WHERE id=?", (pid,))
                 row = cur.fetchone()
-            if row and row[0] and os.path.exists(row[0]):
-                self._send_file(row[0], is_image=True)
+            if row and row[0] and os.path.exists(map_path(row[0])):
+                self._send_file(map_path(row[0]), is_image=True)
                 return
-            self.send_error(404, "No cover for playlist")
+            self._placeholder_image()
             return
         elif cov_id.startswith('pl_'):
             # 旧格式歌单封面 compat
@@ -995,21 +1255,31 @@ class SubsonicHandler(BaseHTTPRequestHandler):
                 cur = DB.cursor()
                 cur.execute("SELECT cover_art_path FROM playlists WHERE id=?", (pid,))
                 row = cur.fetchone()
-            if row and row[0] and os.path.exists(row[0]):
-                self._send_file(row[0], is_image=True)
+            if row and row[0] and os.path.exists(map_path(row[0])):
+                self._send_file(map_path(row[0]), is_image=True)
                 return
-            self.send_error(404, "No cover for playlist")
+            self._placeholder_image()
             return
         elif cov_id.startswith('art_'):
-            # 旧格式 compat
+            # 旧格式 compat: 直接查 artists 表
+            try:
+                with DB_LOCK:
+                    cur = DB.cursor()
+                    cur.execute("SELECT cover_art_path FROM artists WHERE id=?", (cov_id,))
+                    row = cur.fetchone()
+                if row and row[0] and os.path.exists(map_path(row[0])):
+                    self._send_file(map_path(row[0]), is_image=True)
+                    return
+            except:
+                pass
             alb_ids = ARTIST_ALBUMS.get(cov_id, set())
             for alb_id in alb_ids:
                 al = ALBUM_CACHE.get(alb_id, {})
                 cp = al.get('cover_path', '')
-                if cp and os.path.exists(cp):
-                    self._send_file(cp, is_image=True)
+                if cp and os.path.exists(map_path(cp)):
+                    self._send_file(map_path(cp), is_image=True)
                     return
-            self.send_error(404, "No cover for artist")
+            self._placeholder_image()
             return
         elif cov_id.startswith('trk_'):
             # 歌曲→从专辑取封面
@@ -1021,23 +1291,17 @@ class SubsonicHandler(BaseHTTPRequestHandler):
                         al = ALBUM_CACHE.get(t['album_id'], {})
                         break
             cp = al.get('cover_path', '') if al else ''
-            if cp and os.path.exists(cp):
-                self._send_file(cp, is_image=True)
+            if cp and os.path.exists(map_path(cp)):
+                self._send_file(map_path(cp), is_image=True)
                 return
-            # 无封面时返回空白占位图，避免客户端渲染卡住
-            px = b'\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x02\x00\x00\x00\x90wS\xde\x00\x00\x00\x0cIDATx\x9cc\xf8\x0f\x00\x00\x01\x01\x00\x05\x18\xd8N\x00\x00\x00\x00IEND\xaeB`\x82'
-            self.send_response(200)
-            self.send_header('Content-Type', 'image/png')
-            self.send_header('Content-Length', str(len(px)))
-            self.end_headers()
-            self.wfile.write(px)
+            self._placeholder_image()
             return
 
         # 专辑封面 (alb_ 开头或原始 ID)
         al = ALBUM_CACHE.get(real_id, {})
         cover_path = al.get('cover_path', '')
-        if cover_path and os.path.exists(cover_path):
-            self._send_file(cover_path, is_image=True)
+        if cover_path and os.path.exists(map_path(cover_path)):
+            self._send_file(map_path(cover_path), is_image=True)
             return
 
         # fallback
@@ -1046,13 +1310,13 @@ class SubsonicHandler(BaseHTTPRequestHandler):
                 cur = DB.cursor()
                 cur.execute("SELECT cover_art_path FROM albums WHERE id=?", (real_id,))
                 row = cur.fetchone()
-            if row and row[0] and os.path.exists(row[0]):
-                self._send_file(row[0], is_image=True)
+            if row and row[0] and os.path.exists(map_path(row[0])):
+                self._send_file(map_path(row[0]), is_image=True)
                 return
         except:
             pass
 
-        self.send_error(404, "Cover not found")
+        self._placeholder_image()
 
     def _send_file(self, fp, is_image=False):
         if not os.path.exists(fp):
@@ -1149,11 +1413,17 @@ def main():
     parser.add_argument('--port', type=int, default=4040)
     parser.add_argument('--db', default=None, help='数据库路径 (自动检测)')
     parser.add_argument('--no-auth', action='store_true', help='禁用鉴权 (不推荐)')
+    parser.add_argument('--music-dir', default='', help='宿主机音乐根目录 (映射 /music 容器路径)')
     args = parser.parse_args()
 
     if args.no_auth:
         global AUTH_ENABLED
         AUTH_ENABLED = False
+
+    if args.music_dir:
+        global MUSIC_DIR
+        MUSIC_DIR = args.music_dir.rstrip('/')
+        print(f"  音乐目录映射: /music → {MUSIC_DIR}")
 
     # 找数据库
     db_path = args.db or os.environ.get("DLY_DB") or find_db()
