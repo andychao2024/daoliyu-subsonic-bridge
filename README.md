@@ -1,5 +1,6 @@
 # 道理鱼 Subsonic API 桥
 
+## 兼容  [Music-assistant](https://music-assistant.io/) OpenSubsonic Media Server Library 
 [道理鱼音乐](https://www.daoliyu.com/) → 标准 [Subsonic](http://www.subsonic.org/) / [OpenSubsonic](https://opensubsonic.netlify.app/) API 桥接服务。
 
 让 Navidrome / Feishin / SPlayer / 箭头音乐 / Symfonium 等支持 Subsonic 协议的客户端直接访问道理鱼的音乐库。
@@ -9,7 +10,7 @@
 | 功能 | 支持 |
 |------|------|
 | 歌曲/专辑/艺人浏览 | ✅ |
-| 搜索 (search2/search3) | ✅ |
+| 搜索 (search2/search3) | ✅ | 
 | 歌单管理 (含封面) | ✅ |
 | 随机歌曲 | ✅ |
 | 按流派浏览 | ✅ |

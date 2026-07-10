@@ -66,7 +66,7 @@ def map_path(db_path):
     """将数据库中的容器路径映射到宿主机路径"""
     if not db_path:
         return db_path
-    if MUSIC_DIR and db_path.startswith('/music/'):
+    if MUSIC_DIR and db_path.lower().startswith('/music/'):
         return os.path.join(MUSIC_DIR, db_path[7:])
     if db_path.startswith('/app/runtime/data/'):
         return os.path.join(DB_DIR, db_path[18:])  # /app/runtime/data/ -> DB_DIR/
@@ -858,7 +858,6 @@ class SubsonicHandler(BaseHTTPRequestHandler):
         return album
 
     def handle_get_artists(self, resp, qs):
-        tag = 'indexes' if '/getIndexes' in self.path else 'artists'
         items = []
         for aid, name in ARTIST_CACHE.items():
             cnt = len(ARTIST_ALBUMS.get(aid, set()))
@@ -872,11 +871,13 @@ class SubsonicHandler(BaseHTTPRequestHandler):
                 k = '#'
             idx.setdefault(k, []).append(item)
 
-        resp[tag] = {
+        index_data = {
             "ignoredArticles": "The El La Los Las Le Les",
             "ignored_articles": "The El La Los Las Le Les",
             "index": [{"name": k, "artist": v} for k, v in sorted(idx.items())]
         }
+        resp['artists'] = index_data
+        resp['indexes'] = index_data
 
     def handle_get_indexes(self, resp, qs):
         self.handle_get_artists(resp, qs)
@@ -963,25 +964,22 @@ class SubsonicHandler(BaseHTTPRequestHandler):
     def handle_get_artist_info2(self, resp, qs):
         aid = qs.get('id', [''])[0]
         bio = ''
-        cover_url = ''
         try:
             with DB_LOCK:
                 cur = DB.cursor()
-                cur.execute("SELECT bio, cover_art_path FROM artists WHERE id=?", (aid,))
+                cur.execute("SELECT bio FROM artists WHERE id=?", (aid,))
                 row = cur.fetchone()
             if row:
                 bio = row[0] or ''
-                if row[1]:
-                    cover_url = '/api/cover?path=' + quote(row[1])
         except:
             pass
         resp['artistInfo2'] = {
             "biography": bio,
             "musicBrainzId": "",
             "lastFmUrl": "",
-            "smallImageUrl": cover_url,
-            "mediumImageUrl": cover_url,
-            "largeImageUrl": cover_url,
+            "smallImageUrl": "",
+            "mediumImageUrl": "",
+            "largeImageUrl": "",
             "similarArtist": [],
         }
 
@@ -1028,7 +1026,9 @@ class SubsonicHandler(BaseHTTPRequestHandler):
                         item["playCount"] = 1
                         item["coverArt"] = "al-" + aid
                         items.append(item)
-            resp['albumList2'] = {"album": items[offset:offset+size]}
+            result = {"album": items[offset:offset+size]}
+            resp['albumList2'] = result
+            resp['albumList'] = result
             return
 
         # 全量专辑列表
@@ -1039,14 +1039,18 @@ class SubsonicHandler(BaseHTTPRequestHandler):
 
         if atype in ('newest', 'byYear', 'recent', 'byGenre'):
             items.sort(key=lambda a: int(a.get('year', 0) or 0), reverse=True)
-        elif atype == 'alphabeticalByName' or atype == 'alphabeticalByArtist':
+        elif atype == 'alphabeticalByName':
             items.sort(key=lambda a: a['name'].lower())
+        elif atype == 'alphabeticalByArtist':
+            items.sort(key=lambda a: a.get('artist', '').lower())
         elif atype == 'frequent' or atype == 'random':
             random.shuffle(items)
         else:
             items.sort(key=lambda a: a['name'].lower())
 
-        resp['albumList2'] = {"album": items[offset:offset+size]}
+        result = {"album": items[offset:offset+size]}
+        resp['albumList2'] = result
+        resp['albumList'] = result
 
     def handle_get_album(self, resp, qs):
         alb_id = qs.get('id', [''])[0]
@@ -1090,7 +1094,8 @@ class SubsonicHandler(BaseHTTPRequestHandler):
 
         for t in TRACK_CACHE:
             title = (t.get('title', '') or '').lower()
-            if not query or query in title:
+            artist_names = [self._artist_name(a).lower() for a in TRACK_ALL_MAP.get(t['id'], [])]
+            if not query or query in title or any(query in n for n in artist_names):
                 songs.append(self._build_song(t))
 
         result = {}
@@ -1125,7 +1130,8 @@ class SubsonicHandler(BaseHTTPRequestHandler):
                                "artist": self._artist_name(art_id), "coverArt": "al-" + alb_id})
         for t in TRACK_CACHE:
             title = (t.get('title', '') or '').lower()
-            if not query or query in title:
+            artist_names = [self._artist_name(a).lower() for a in TRACK_ALL_MAP.get(t['id'], [])]
+            if not query or query in title or any(query in n for n in artist_names):
                 songs.append(self._build_song(t))
 
         resp['searchResult2'] = {
@@ -1420,11 +1426,6 @@ def main():
         global AUTH_ENABLED
         AUTH_ENABLED = False
 
-    if args.music_dir:
-        global MUSIC_DIR
-        MUSIC_DIR = args.music_dir.rstrip('/')
-        print(f"  音乐目录映射: /music → {MUSIC_DIR}")
-
     # 找数据库
     db_path = args.db or os.environ.get("DLY_DB") or find_db()
     if not db_path:
@@ -1439,6 +1440,12 @@ def main():
         sys.exit(1)
 
     init_db(db_path)
+
+    if args.music_dir:
+        global MUSIC_DIR
+        MUSIC_DIR = args.music_dir.rstrip('/')
+        print(f"  音乐目录映射: /music → {MUSIC_DIR}")
+
     refresh_cache()
 
     server = ThreadingHTTPServer((args.host, args.port), SubsonicHandler)
